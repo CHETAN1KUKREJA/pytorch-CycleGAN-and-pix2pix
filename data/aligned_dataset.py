@@ -2,7 +2,7 @@ import os
 import glob
 from data.base_dataset import BaseDataset, get_transform_3D
 
-class Aligned3DDataset(BaseDataset):
+class AlignedDataset(BaseDataset):
     """
     This dataset class loads paired 3D medical images.
     It assumes that the directory '/path/to/data/train/A' and '/path/to/data/train/B' contain paired images.
@@ -18,12 +18,12 @@ class Aligned3DDataset(BaseDataset):
         BaseDataset.__init__(self, opt)
 
         # Get the sorted list of all NIfTI image paths for both domains
-        self.A_paths = sorted(glob.glob(os.path.join(opt.dataroot, f'{opt.A_Prefix}.nii.gz')))
-        self.B_paths = sorted(glob.glob(os.path.join(opt.dataroot, f'{opt.B_Prefix}.nii.gz')))
+        self.A_paths = sorted(glob.glob(os.path.join(opt.dataroot,"*", f'{opt.A_Prefix}.nii.gz')))
+        self.B_paths = sorted(glob.glob(os.path.join(opt.dataroot,"*", f'{opt.B_Prefix}.nii.gz')))
 
         # Ensure that we have the same number of images in both domains for pairing
         assert len(self.A_paths) == len(self.B_paths), \
-            f"The number of images in {self.dir_A} and {self.dir_B} must be the same for paired data."
+            f"The number of images in {self.A_paths} and {self.B_paths} must be the same for paired data."
 
         # Get the MONAI transform pipeline
         self.transform = get_transform_3D(self.opt, self.params)
