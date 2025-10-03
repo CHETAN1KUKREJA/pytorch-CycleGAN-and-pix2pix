@@ -9,6 +9,8 @@ import torch.utils.data as data
 from PIL import Image
 import torchvision.transforms as transforms
 from abc import ABC, abstractmethod
+import monai.transforms as transforms
+from monai.transforms import RandSpatialCropSamplesd, CenterSpatialCropd
 
 
 class BaseDataset(data.Dataset, ABC):
@@ -29,6 +31,14 @@ class BaseDataset(data.Dataset, ABC):
         """
         self.opt = opt
         self.root = opt.dataroot
+        self.params = {
+            'num_pool': 100, #This is likely related to a GAN (Generative Adversarial Network) architecture like CycleGAN, where it specifies the size of an image buffer to store previously generated images.
+            'roi_size': [128,128,128], #This defines the size of the 3D patch (Region of Interest or ROI) that will be cropped from the full images. The model will be trained on these smaller 128x128x128 voxel cubes.
+            'samples_per_image': 8, 
+            'pixdim':(1,1,1), #This sets the target voxel spacing in millimeters. Medical images can have different resolutions, so this step resamples all images to have a consistent physical size per voxel
+            'imgA_intensity_range': (-1000,1000), #This specifies the original intensity range for Image A (likely a CT scan, as these values correspond to Hounsfield Units).
+            'imgB_intensity_range': (0,1500), #This is the original intensity range for Image B (likely an MRI scan).
+        }
 
     @staticmethod
     def modify_commandline_options(parser, is_train):
@@ -61,107 +71,51 @@ class BaseDataset(data.Dataset, ABC):
         pass
 
 
-def get_params(opt, size):
-    w, h = size
-    new_h = h
-    new_w = w
-    if opt.preprocess == "resize_and_crop":
-        new_h = new_w = opt.load_size
-    elif opt.preprocess == "scale_width_and_crop":
-        new_w = opt.load_size
-        new_h = opt.load_size * h // w
+def get_transform_3D(opt, params=None):
+    """
+    Returns a MONAI transform pipeline for 3D medical image processing.
 
-    x = random.randint(0, np.maximum(0, new_w - opt.crop_size))
-    y = random.randint(0, np.maximum(0, new_h - opt.crop_size))
+    Args:
+        mode (str): 'train' for training transforms with augmentation, 
+                    'test' for deterministic validation/testing transforms.
+        params (dict): A dictionary containing parameters like 'pixdim', 'roi_size', etc.
+    
+    Returns:
+        monai.transforms.Compose: The composed transform pipeline.
+    """
+    keys = ['imgA', 'imgB']
+    base_transforms = [
+        transforms.LoadImaged(keys=keys),
+        transforms.EnsureChannelFirstd(keys=keys),
+        transforms.Spacingd(keys=keys, pixdim=params['pixdim'], mode=("bilinear", "bilinear")),
+        transforms.ScaleIntensityRanged(keys=['imgA'], a_min=params['imgA_intensity_range'][0], a_max=params['imgA_intensity_range'][1], b_min=-1.0, b_max=1.0, clip=True),
+        transforms.ScaleIntensityRanged(keys=['imgB'], a_min=params['imgB_intensity_range'][0], a_max=params['imgB_intensity_range'][1], b_min=-1.0, b_max=1.0, clip=False),
+        transforms.CropForegroundd(keys=keys, source_key='imgA'), # Crop both based on imgA's foreground
+        transforms.SpatialPadd(keys=keys, spatial_size=params['roi_size'], method='end') # <-- MOVED HERE!
+    ]
 
-    flip = random.random() > 0.5
+    if opt.isTrain:
+        # Add random augmentations for training
+        train_specific_transforms = [
+            RandSpatialCropSamplesd(
+                keys=keys,
+                roi_size=params['roi_size'],
+                num_samples=params['samples_per_image'],
+                random_size=False,
+                random_center=True
+            )
+        ]
+        all_transforms = base_transforms + train_specific_transforms
+    elif not opt.isTrain:
+        # Use deterministic cropping for testing/validation
+        test_specific_transforms = [
+            transforms.CenterSpatialCropd(keys=keys, roi_size=params['roi_size']),
+        ]
+        all_transforms = base_transforms + test_specific_transforms
+    else:
+        raise ValueError(f"Mode '{opt.isTrain}' not recognized. Use 'True' or 'False'.")
 
-    return {"crop_pos": (x, y), "flip": flip}
-
-
-def get_transform(opt, params=None, grayscale=False, method=transforms.InterpolationMode.BICUBIC, convert=True):
-    transform_list = []
-    if grayscale:
-        transform_list.append(transforms.Grayscale(1))
-    if "resize" in opt.preprocess:
-        osize = [opt.load_size, opt.load_size]
-        transform_list.append(transforms.Resize(osize, method))
-    elif "scale_width" in opt.preprocess:
-        transform_list.append(transforms.Lambda(lambda img: __scale_width(img, opt.load_size, opt.crop_size, method)))
-
-    if "crop" in opt.preprocess:
-        if params is None:
-            transform_list.append(transforms.RandomCrop(opt.crop_size))
-        else:
-            transform_list.append(transforms.Lambda(lambda img: __crop(img, params["crop_pos"], opt.crop_size)))
-
-    if opt.preprocess == "none":
-        transform_list.append(transforms.Lambda(lambda img: __make_power_2(img, base=4, method=method)))
-
-    if not opt.no_flip:
-        if params is None:
-            transform_list.append(transforms.RandomHorizontalFlip())
-        elif params["flip"]:
-            transform_list.append(transforms.Lambda(lambda img: __flip(img, params["flip"])))
-
-    if convert:
-        transform_list += [transforms.ToTensor()]
-        if grayscale:
-            transform_list += [transforms.Normalize((0.5,), (0.5,))]
-        else:
-            transform_list += [transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-    return transforms.Compose(transform_list)
-
-
-def __transforms2pil_resize(method):
-    mapper = {
-        transforms.InterpolationMode.BILINEAR: Image.BILINEAR,
-        transforms.InterpolationMode.BICUBIC: Image.BICUBIC,
-        transforms.InterpolationMode.NEAREST: Image.NEAREST,
-        transforms.InterpolationMode.LANCZOS: Image.LANCZOS,
-    }
-    return mapper[method]
-
-
-def __make_power_2(img, base, method=transforms.InterpolationMode.BICUBIC):
-    method = __transforms2pil_resize(method)
-    ow, oh = img.size
-    h = int(round(oh / base) * base)
-    w = int(round(ow / base) * base)
-    if h == oh and w == ow:
-        return img
-
-    __print_size_warning(ow, oh, w, h)
-    return img.resize((w, h), method)
-
-
-def __scale_width(img, target_size, crop_size, method=transforms.InterpolationMode.BICUBIC):
-    method = __transforms2pil_resize(method)
-    ow, oh = img.size
-    if ow == target_size and oh >= crop_size:
-        return img
-    w = target_size
-    h = int(max(target_size * oh / ow, crop_size))
-    return img.resize((w, h), method)
-
-
-def __crop(img, pos, size):
-    ow, oh = img.size
-    x1, y1 = pos
-    tw = th = size
-    if ow > tw or oh > th:
-        return img.crop((x1, y1, x1 + tw, y1 + th))
-    return img
-
-
-def __flip(img, flip):
-    if flip:
-        return img.transpose(Image.FLIP_LEFT_RIGHT)
-    return img
-
-
-def __print_size_warning(ow, oh, w, h):
-    """Print warning information about image size(only print once)"""
-    if not hasattr(__print_size_warning, "has_printed"):
-        print("The image size needs to be a multiple of 4. " "The loaded image size was (%d, %d), so it was adjusted to " "(%d, %d). This adjustment will be done to all images " "whose sizes are not multiples of 4" % (ow, oh, w, h))
-        __print_size_warning.has_printed = True
+    # SpatialPad is useful if cropping might result in a smaller-than-ROI size
+    all_transforms.append(transforms.SpatialPadd(keys=keys, spatial_size=params['roi_size']))
+    
+    return transforms.Compose(all_transforms)

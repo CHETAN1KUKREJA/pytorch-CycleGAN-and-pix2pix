@@ -7,7 +7,7 @@ from pathlib import Path
 import wandb
 import os
 import torch.distributed as dist
-
+from tqdm import tqdm  # <-- 1. ADDED: Import tqdm to fix printing with progress bar
 
 def save_images(webpage, visuals, image_path, aspect_ratio=1.0, width=256):
     """Save images to the disk.
@@ -66,6 +66,7 @@ class Visualizer:
             # Only initialize wandb on main process (rank 0)
             if not dist.is_initialized() or dist.get_rank() == 0:
                 self.wandb_project_name = getattr(opt, "wandb_project_name", "CycleGAN-and-pix2pix")
+                os.environ["WANDB_ANONYMOUS"] = "never"
                 self.wandb_run = wandb.init(project=self.wandb_project_name, name=opt.name, config=opt) if not wandb.run else wandb.run
                 self.wandb_run._label(repo="CycleGAN-and-pix2pix")
             else:
@@ -96,34 +97,45 @@ class Visualizer:
         return (epoch - 1) * self.dataset_size + epoch_iter
 
     def display_current_results(self, visuals, epoch: int, total_iters: int, save_result=False):
-        """Save current results to wandb and HTML file."""
-        # Only display results on main process (rank 0)
+        """Saves the middle 2D slice of current 3D results to wandb and an HTML file."""        # Only display results on main process (rank 0)
         if "LOCAL_RANK" in os.environ and dist.is_initialized() and dist.get_rank() != 0:
             return
 
+        visuals_2d_slices = {}
+
+
+        for label, volume_tensor in visuals.items():
+            # volume_tensor has a shape like [Batch, Channels, Depth, Height, Width]
+            
+            # Get the index of the middle slice from the Depth dimension (index 2)
+            middle_slice_idx = volume_tensor.shape[2] // 2
+
+            # Extract this slice. The result is a standard 2D image tensor batch [B, C, H, W]
+            slice_tensor = volume_tensor[:, :, middle_slice_idx, :, :]
+            visuals_2d_slices[label] = slice_tensor
+
         if self.use_wandb:
             ims_dict = {}
-            for label, image in visuals.items():
-                image_numpy = util.tensor2im(image)
+            for label, image_slice in visuals_2d_slices.items():  # Use the 2D slice dict
+                image_numpy = util.tensor2im(image_slice)
                 wandb_image = wandb.Image(image_numpy, caption=f"{label} - Step {total_iters}")
                 ims_dict[f"results/{label}"] = wandb_image
-            self.wandb_run.log(ims_dict, step=total_iters)
+            if self.wandb_run:
+                self.wandb_run.log(ims_dict, step=total_iters)
 
-        if self.use_html and (save_result or not self.saved):  # save images to an HTML file if they haven't been saved.
+        if self.use_html and (save_result or not self.saved):
             self.saved = True
-            # save images to the disk
-            for label, image in visuals.items():
-                image_numpy = util.tensor2im(image)
+            for label, image_slice in visuals_2d_slices.items():  # Use the 2D slice dict
+                image_numpy = util.tensor2im(image_slice)
                 img_path = self.img_dir / f"epoch{epoch:03d}_{label}.png"
                 util.save_image(image_numpy, img_path)
 
-            # update website
+            # Update website
             webpage = html.HTML(self.web_dir, f"Experiment name = {self.name}", refresh=1)
             for n in range(epoch, 0, -1):
                 webpage.add_header(f"epoch [{n}]")
                 ims, txts, links = [], [], []
-
-                for label, image in visuals.items():
+                for label, image_slice in visuals_2d_slices.items():  # Use the 2D slice dict
                     img_path = f"epoch{n:03d}_{label}.png"
                     ims.append(img_path)
                     txts.append(label)

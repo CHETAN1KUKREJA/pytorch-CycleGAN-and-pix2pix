@@ -17,6 +17,7 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 import os
 from data.base_dataset import BaseDataset
+from monai.data import DataLoader 
 
 
 def find_dataset_using_name(dataset_name):
@@ -85,7 +86,9 @@ class CustomDatasetDataLoader:
             self.sampler = None
             shuffle = not opt.serial_batches
 
-        self.dataloader = torch.utils.data.DataLoader(self.dataset, batch_size=opt.batch_size, shuffle=shuffle, sampler=self.sampler, num_workers=int(opt.num_threads))
+        self.dataloader = DataLoader(self.dataset, batch_size=opt.batch_size, shuffle=shuffle, sampler=self.sampler, num_workers=int(opt.num_threads))
+        print(f"Dataset size: {len(self.dataloader)}")
+        print("DataLoader created successfully using monai.data.DataLoader!")
 
     def load_data(self):
         return self
